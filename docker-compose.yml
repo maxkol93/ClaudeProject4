@@ -1,0 +1,253 @@
+version: "3.9"
+
+secrets:
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token.txt
+  telegram_webhook_secret:
+    file: ./secrets/telegram_webhook_secret.txt
+  yukassa_shop_id:
+    file: ./secrets/yukassa_shop_id.txt
+  yukassa_secret_key:
+    file: ./secrets/yukassa_secret_key.txt
+  jwt_secret:
+    file: ./secrets/jwt_secret.txt
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+  redis_password:
+    file: ./secrets/redis_password.txt
+
+networks:
+  telepub_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  prometheus_data:
+  grafana_data:
+
+services:
+  # ─── Reverse Proxy ───────────────────────────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - bot
+      - api
+    networks:
+      - telepub_net
+    restart: unless-stopped
+
+  # ─── Bot Service ─────────────────────────────────────────────────────────
+  bot:
+    build:
+      context: .
+      dockerfile: bot/Dockerfile
+    expose:
+      - "8001"
+    environment:
+      - PYTHONPATH=/app
+      - SERVICE=bot
+    secrets:
+      - telegram_bot_token
+      - telegram_webhook_secret
+      - yukassa_secret_key
+      - postgres_password
+      - redis_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - telepub_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ─── API Service ─────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    expose:
+      - "8000"
+    environment:
+      - PYTHONPATH=/app
+      - SERVICE=api
+    secrets:
+      - telegram_bot_token
+      - yukassa_shop_id
+      - yukassa_secret_key
+      - jwt_secret
+      - postgres_password
+      - redis_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - telepub_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ─── Worker Service ──────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    command: celery -A worker.celery_app worker --loglevel=info -Q critical,default,low --concurrency=4
+    environment:
+      - PYTHONPATH=/app
+      - SERVICE=worker
+    secrets:
+      - telegram_bot_token
+      - yukassa_shop_id
+      - yukassa_secret_key
+      - postgres_password
+      - redis_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - telepub_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "celery", "-A", "worker.celery_app", "inspect", "ping"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+
+  # ─── Celery Beat ─────────────────────────────────────────────────────────
+  beat:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    command: celery -A worker.celery_app beat --loglevel=info --scheduler=redbeat.RedBeatScheduler
+    environment:
+      - PYTHONPATH=/app
+      - SERVICE=beat
+    secrets:
+      - postgres_password
+      - redis_password
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - telepub_net
+    restart: unless-stopped
+
+  # ─── PostgreSQL ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: telepub
+      POSTGRES_USER: telepub
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - telepub_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telepub -d telepub"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Redis ───────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: >
+      sh -c "redis-server --requirepass $$(cat /run/secrets/redis_password)"
+    secrets:
+      - redis_password
+    volumes:
+      - redis_data:/data
+    networks:
+      - telepub_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── MinIO ───────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: telepub
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/postgres_password  # reuse for dev
+    secrets:
+      - postgres_password
+    volumes:
+      - minio_data:/data
+    networks:
+      - telepub_net
+    restart: unless-stopped
+
+  # ─── Prometheus ──────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - telepub_net
+    restart: unless-stopped
+
+  # ─── Grafana ─────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    depends_on:
+      - prometheus
+    networks:
+      - telepub_net
+    restart: unless-stopped
+
+  # ─── Celery Flower ───────────────────────────────────────────────────────
+  flower:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    command: celery -A worker.celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - PYTHONPATH=/app
+    secrets:
+      - redis_password
+    depends_on:
+      - redis
+    networks:
+      - telepub_net
+    restart: unless-stopped

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "telepub-analytics": {
+      "command": "python",
+      "args": ["-m", "mcp_server.analytics"],
+      "description": "TelePub Analytics MCP server — exposes channel stats, top posts, and churn prediction to Claude",
+      "env": {
+        "PYTHONPATH": "."
+      }
+    }
+  }
+}
