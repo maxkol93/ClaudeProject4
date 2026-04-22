@@ -74,6 +74,181 @@ type Payout = {
 
 ## 2. Core Algorithms
 
+### Algorithm: Author Registration FSM
+
+```
+FSM States: idle → awaiting_channel → awaiting_bot_admin → awaiting_yukassa → complete
+
+FUNCTION handle_registration_start(telegram_user_id):
+  state = fsm.get_state(telegram_user_id)
+  IF state is None:
+    fsm.set_state(telegram_user_id, "awaiting_channel")
+    bot.send_message(telegram_user_id,
+      "👋 Добро пожаловать в TelePub!\n\n"
+      "Отправьте @username вашего Telegram-канала:"
+    )
+
+FUNCTION handle_channel_input(telegram_user_id, channel_username):
+  STATE: awaiting_channel
+  
+  channel = telegram_api.get_chat(channel_username)
+  IF channel is None OR channel.type != "channel":
+    bot.send_message(telegram_user_id, "❌ Канал не найден. Попробуйте ещё раз.")
+    RETURN
+  
+  member = telegram_api.get_chat_member(channel.id, telegram_user_id)
+  IF member.status NOT IN ["creator", "administrator"]:
+    bot.send_message(telegram_user_id, "❌ Вы не являетесь администратором этого канала.")
+    RETURN
+  
+  fsm.set_data(telegram_user_id, {"channel_id": channel.id, "channel_title": channel.title})
+  fsm.set_state(telegram_user_id, "awaiting_bot_admin")
+  bot.send_message(telegram_user_id,
+    f"✅ Канал '{channel.title}' найден.\n\n"
+    "Добавьте @TelePubBot как администратора с правами:\n"
+    "• Пригласить пользователей\n• Удалить участников\n\n"
+    "Нажмите 'Проверить' когда готово.",
+    reply_markup=InlineKeyboard("Проверить ✅", callback="check_bot_rights")
+  )
+
+FUNCTION handle_check_bot_rights(telegram_user_id):
+  STATE: awaiting_bot_admin
+  
+  data = fsm.get_data(telegram_user_id)
+  channel_id = data["channel_id"]
+  
+  bot_member = telegram_api.get_chat_member(channel_id, BOT_USER_ID)
+  IF bot_member.status != "administrator":
+    bot.send_message(telegram_user_id, "❌ Бот не добавлен как администратор. Попробуйте ещё раз.")
+    RETURN
+  IF NOT (bot_member.can_invite_users AND bot_member.can_restrict_members):
+    bot.send_message(telegram_user_id, "❌ Недостаточно прав. Нужны: Пригласить + Удалить участников.")
+    RETURN
+  
+  // Создать закрытый канал или получить invite link
+  invite_link = telegram_api.create_chat_invite_link(channel_id, creates_join_request=False)
+  
+  // Сохранить канал в БД
+  channel = db.channels.create(
+    author_id=db.authors.get_or_create(telegram_user_id).id,
+    telegram_channel_id=channel_id,
+    telegram_invite_link=invite_link,
+    title=data["channel_title"]
+  )
+  fsm.set_data(telegram_user_id, {**data, "db_channel_id": channel.id})
+  
+  // Запросить настройку подписки
+  fsm.set_state(telegram_user_id, "awaiting_plan_setup")
+  bot.send_message(telegram_user_id,
+    "💰 Установите цену подписки (в рублях/месяц):\n"
+    "Минимум: 100 руб | Рекомендуем: 300-500 руб"
+  )
+
+FUNCTION handle_plan_price_input(telegram_user_id, price_text):
+  STATE: awaiting_plan_setup
+  
+  TRY:
+    price = Decimal(price_text)
+  EXCEPT:
+    bot.send_message(telegram_user_id, "❌ Введите число. Например: 299")
+    RETURN
+  
+  IF price < 100:
+    bot.send_message(telegram_user_id, "❌ Минимальная цена — 100 руб.")
+    RETURN
+  
+  data = fsm.get_data(telegram_user_id)
+  plan = db.subscription_plans.create(
+    channel_id=data["db_channel_id"],
+    price_rub=price,
+    billing_interval="monthly"
+  )
+  
+  fsm.set_state(telegram_user_id, "awaiting_yukassa")
+  yukassa_oauth_url = generate_yukassa_oauth_url(telegram_user_id)
+  
+  bot.send_message(telegram_user_id,
+    f"✅ Цена установлена: {price} руб/мес\n\n"
+    "Последний шаг — подключите ЮKassa для получения платежей:",
+    reply_markup=InlineKeyboard("Подключить ЮKassa 💳", url=yukassa_oauth_url)
+  )
+
+FUNCTION handle_yukassa_oauth_callback(telegram_user_id, shop_id, secret_key):
+  // Вызывается после OAuth redirect от ЮKassa
+  author = db.authors.get(telegram_user_id=telegram_user_id)
+  author.yukassa_shop_id = shop_id
+  author.yukassa_account_id = generate_account_id()
+  author.verified = True
+  db.save(author)
+  
+  data = fsm.get_data(telegram_user_id)
+  subscribe_link = f"https://t.me/TelePubBot?start=channel_{data['db_channel_id']}"
+  
+  fsm.clear(telegram_user_id)
+  bot.send_message(telegram_user_id,
+    f"🎉 Всё готово! Ваш канал подключён к TelePub.\n\n"
+    f"Ссылка для подписчиков:\n{subscribe_link}\n\n"
+    "Поделитесь ей с аудиторией 🚀"
+  )
+```
+
+### Algorithm: Analytics Aggregation
+
+```
+FUNCTION aggregate_channel_analytics(channel_id, period_days=30):
+  INPUT: channel_id: UUID, period_days: Int
+  OUTPUT: AnalyticsSnapshot
+
+  period_start = NOW() - period_days days
+
+  // MRR расчёт
+  active_subs = db.subscriptions.filter(
+    channel.id=channel_id, status="active"
+  )
+  mrr = SUM(sub.plan.price_rub for sub in active_subs)
+
+  // Новые и отписавшиеся за период
+  new_subs = db.subscriptions.filter(
+    channel.id=channel_id,
+    started_at__gte=period_start,
+    status__in=["active", "expired", "cancelled"]
+  ).count()
+
+  churned_subs = db.subscriptions.filter(
+    channel.id=channel_id,
+    cancelled_at__gte=period_start
+  ).count() + db.subscriptions.filter(
+    channel.id=channel_id,
+    status="expired",
+    expires_at__gte=period_start
+  ).count()
+
+  // ARPU
+  arpu = mrr / active_subs.count() IF active_subs.count() > 0 ELSE 0
+
+  // LTV estimate: ARPU / churn_rate
+  monthly_churn_rate = churned_subs / (active_subs.count() + churned_subs) IF total > 0 ELSE 0.05
+  ltv_estimate = (arpu / monthly_churn_rate) IF monthly_churn_rate > 0 ELSE arpu * 24
+
+  // MRR trend (сравнение с предыдущим периодом)
+  prev_mrr = calculate_mrr_at_date(channel_id, NOW() - period_days days)
+  mrr_trend_pct = ((mrr - prev_mrr) / prev_mrr * 100) IF prev_mrr > 0 ELSE 0
+
+  RETURN AnalyticsSnapshot(
+    mrr=mrr,
+    mrr_trend_pct=mrr_trend_pct,
+    active_subscribers=active_subs.count(),
+    new_subscribers=new_subs,
+    churned_subscribers=churned_subs,
+    arpu=arpu,
+    ltv_estimate=ltv_estimate
+  )
+
+// Кэширование: результат кэшируется в Redis на 1 час
+// Cache key: f"analytics:{channel_id}:{period_days}"
+```
+
+
 ### Algorithm: Calculate Platform Fee
 
 ```

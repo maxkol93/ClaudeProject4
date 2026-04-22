@@ -318,6 +318,24 @@ graph TB
     YK -->|"Payment webhooks"| TelePub
 ```
 
+### MCP Server Integration (AI Analytics)
+
+```
+TelePub API ←→ MCP Server (telepub-analytics-mcp)
+                    ↓
+              Claude API (claude-sonnet-4-6)
+                    ↓
+              AI Insights Generation:
+              - "Лучшее время для публикации: вторник 19:00-21:00"
+              - "Прогноз оттока: 15% подписчиков в следующие 30 дней"
+              - "Темы с наибольшим вовлечением: финансовые кейсы, разборы"
+```
+
+MCP tools exposed:
+- `get_channel_stats(channel_id, period)` → raw metrics
+- `get_top_posts(channel_id, limit)` → engagement data
+- `predict_churn(channel_id)` → ML-based churn risk
+
 ### C4 Level 2: Container Diagram
 ```mermaid
 graph TB
